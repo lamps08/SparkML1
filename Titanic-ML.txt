@@ -1,3 +1,7 @@
+## Reference: Notes of Dr Sridhar Nerur for Big Data 
+## Reference Data bricks ML Lib tutorials https://docs.databricks.com/spark/latest/mllib/index.html#mllib
+## coded on data bricks community edition
+
 
 train_df = sqlContext.read.load('/FileStore/tables/train.csv', 
                           format='com.databricks.spark.csv', 
