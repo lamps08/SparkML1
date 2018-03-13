@@ -1,0 +1,223 @@
+
+train_df = sqlContext.read.load('/FileStore/tables/train.csv', 
+                          format='com.databricks.spark.csv', 
+                          header='true', 
+                          inferSchema='true')
+
+test_df = sqlContext.read.load('/FileStore/tables/test.csv', 
+                          format='com.databricks.spark.csv', 
+                          header='true', 
+                          inferSchema='true')
+
+
+
+#Marking the train and test with colum ident and combining to form a single data set
+
+from pyspark.sql.functions import lit, col
+train_df = train_df.withColumn('ident',lit('train'))
+
+test_df = (test_df.withColumn('Survived',lit(0))
+                  .withColumn('ident',lit('test')))
+test_df = test_df[train_df.columns]
+
+df = train_df.unionAll(test_df)
+
+
+# Feature engineering to create a new column from name containg  the title 
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
+
+Createtitle =  udf(lambda name: name.split(',')[1].split('.')[0],StringType())
+df = df.withColumn('Title', Createtitle(df['Name']))
+
+df = (df.withColumn('Age',df['Age'].cast('double'))
+            .withColumn('SibSp',df['SibSp'].cast('double'))
+            .withColumn('Parch',df['Parch'].cast('double'))
+            .withColumn('Fare',df['Fare'].cast('double'))
+            .withColumn('Survived',df['Survived'].cast('double'))
+            )
+df.printSchema()
+
+# Creationg a function to count the null values in the features and filling the null values with mean where applicable 
+
+def countofnull(df,feature):
+  return df.where(df[feature].isNull()).count()
+
+listofnumfeat = ['Survived','Age','SibSp','Parch','Fare']
+nulls = {feature: countofnull(df,feature) for feature in listofnumfeat}
+age_m = df.groupBy().mean('Age').first()[0]
+fare_m = df.groupBy().mean('Fare').first()[0]
+df = df.na.fill({'Age':age_m,'Fare':fare_m})
+
+
+
+listofvar1 = ['Survived','Age','SibSp','Parch','Fare','PassengerId','Pclass','Name','Sex','Ticket','Cabin','Embarked','Title']
+nulls = {var: countofnull(df,var) for var in listofvar1}
+print(nulls)
+
+
+df = df.drop("Name")
+
+
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
+
+categoricalColumns = ["Pclass" ,"Sex","Title"]
+stages = [] # stages in our Pipeline
+for categoricalCol in categoricalColumns:
+  # Category Indexing with StringIndexer
+  stringIndexer = StringIndexer(inputCol=categoricalCol, outputCol=categoricalCol+"Index")
+  # Use OneHotEncoder to convert categorical variables into binary SparseVectors
+  encoder = OneHotEncoder(inputCol=categoricalCol+"Index", outputCol=categoricalCol+"classVec")
+  # Add stages.  These are not run here, but will run all at once later on.
+  stages += [stringIndexer, encoder]
+
+label_stringIdx = StringIndexer(inputCol = "Survived", outputCol = "label")
+stages += [label_stringIdx]
+
+numericCols = [ "Age", "SibSp", "Parch","Fare"]
+assemblerInputs = map(lambda c: c + "classVec", categoricalColumns) + numericCols
+assembler = VectorAssembler(inputCols=assemblerInputs, outputCol="features")
+stages += [assembler]
+
+
+cols = df.columns
+# Create a Pipeline.
+pipeline = Pipeline(stages=stages)
+# Run the feature transformations.
+#  - fit() computes feature statistics as needed.
+#  - transform() actually transforms the features.
+pipelineModel = pipeline.fit(df)
+dataset = pipelineModel.transform(df)
+
+# Keep relevant columns
+selectedcols = ["label", "features"] + cols
+dataset = dataset.select(selectedcols)
+#display(dataset)
+#type(dataset)
+dataset.toPandas()
+
+#Seprating the trained and test data which we combined earlier 
+train_df = dataset.where(df.ident =='train')
+test_df = dataset.where(df.ident =='test')
+
+
+#specifing the random split ratio for the train and test data 
+(trainingData, ValidateData) = train_df.randomSplit([0.65, 0.35],seed = 120)
+print trainingData.count()
+print ValidateData.count()
+
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+
+# Create initial LogisticRegression model
+lr = LogisticRegression(labelCol="label", featuresCol="features")
+
+# Evaluate model
+evaluator = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction")
+
+# Create ParamGrid for Cross Validation
+paramGrid = (ParamGridBuilder()
+             .addGrid(lr.regParam, [0.01, 0.5, 2.0])
+             .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
+             .addGrid(lr.maxIter, [1, 5, 10,15])
+             .build())
+
+# Create 5-fold CrossValidator
+cv = CrossValidator(estimator=lr, estimatorParamMaps=paramGrid, evaluator=evaluator, numFolds=5)
+
+# Run cross validations
+cvModel = cv.fit(trainingData)
+predictions = cvModel.transform(ValidateData)
+#Output_Predictions = cvModel.transform(test_df)
+predictions.printSchema()
+#Output_Predictions.printSchema()
+evaluator.evaluate(predictions)
+
+print 'Model Intercept: ', cvModel.bestModel.intercept
+
+weights = cvModel.bestModel.coefficients
+weights = map(lambda w: (float(w),), weights)  # convert numpy type to float, and to tuple
+weightsDF = sqlContext.createDataFrame(weights, ["Feature Weight"])
+weightsDF.toPandas()
+
+from pyspark.ml.classification import DecisionTreeClassifier
+
+# Create initial Decision Tree Model
+dt = DecisionTreeClassifier(labelCol="label", featuresCol="features")
+(trainingData, ValidateData) = train_df.randomSplit([0.65, 0.35], seed = 120)
+print trainingData.count()
+print ValidateData.count()
+
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+
+paramGrid = (ParamGridBuilder()
+             .addGrid(dt.maxDepth, [1,2,6,10])
+             .addGrid(dt.maxBins, [20,40,80])
+             .build())
+cv = CrossValidator(estimator=dt, estimatorParamMaps=paramGrid, evaluator=evaluator,numFolds=5)
+
+# Run cross validations
+cvModel = cv.fit(train_df)
+# Takes ~5 minutes
+
+print "numNodes = ", cvModel.bestModel.numNodes
+print "depth = ", cvModel.bestModel.depth
+predictions_Dt = cvModel.transform(ValidateData)
+#Output_predictions = cvModel.transform(test_df)
+evaluator.evaluate(predictions)
+
+from pyspark.ml.classification import RandomForestClassifier
+
+# Create an initial RandomForest model.
+rf = RandomForestClassifier(labelCol="label", featuresCol="features")
+(trainingData, ValidateData) = train_df.randomSplit([0.65, 0.35],seed= 120)
+
+# Train model with Training Data
+#rfModel = rf.fit(trainingData)
+
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+
+paramGrid = (ParamGridBuilder()
+             .addGrid(rf.maxDepth, [2, 4, 6])
+             .addGrid(rf.maxBins, [20,40, 60])
+             .addGrid(rf.numTrees, [5,10,15,20])
+             .build())
+cv = CrossValidator(estimator=rf, estimatorParamMaps=paramGrid, evaluator=evaluator, numFolds=5)
+
+# Run cross validations.  This can take about 6 minutes since it is training over 20 trees!
+cvModel = cv.fit(trainingData)
+
+predictions_rf = cvModel.transform(ValidateData)
+Output_predictions = cvModel.transform(test_df)
+
+from pyspark.ml.classification import MultilayerPerceptronClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+(trainingData, ValidateData) = train_df.randomSplit([0.65, 0.35], seed = 121)
+layers = [24, 5, 4, 2]
+mp = MultilayerPerceptronClassifier(layers = layers)
+
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+
+paramGrid = (ParamGridBuilder()
+             .addGrid(mp.maxIter, [50,100,200])
+             .addGrid(mp.blockSize, [128,256,512])
+             .addGrid(mp.seed, [1234,3223])
+             .build())
+evaluator = MulticlassClassificationEvaluator(metricName="accuracy")
+
+cv = CrossValidator(estimator=mp, estimatorParamMaps=paramGrid, evaluator=evaluator)
+
+
+# Run cross validations.  
+cvModel = cv.fit(trainingData)
+predictions_mc = cvModel.transform(ValidateData)
+evaluator.evaluate(predictions_mc)
+bestModel = cvModel.bestModel
+# Generate predictions for entire dataset
+finalPredictions = bestModel.transform(ValidateData)
+finalPredictions.printSchema()
+# Evaluate best model
+evaluator.evaluate(finalPredictions)
